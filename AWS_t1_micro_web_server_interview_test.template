@@ -1,0 +1,182 @@
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+  
+  "Description" : "AWS interview exercise t1.micro instance template with attached EBS volume. Anton Shmagin 2014.",
+  
+  "Parameters" : {
+      
+    "KeyName": {
+      "Description" : "Name of an existing EC2 KeyPair to enable SSH access to the instances",
+      "Type": "String",
+      "MinLength": "1",
+      "MaxLength": "255",
+      "AllowedPattern" : "[\\x20-\\x7E]*",
+      "ConstraintDescription" : "can contain only ASCII characters."
+    },    
+
+    "VolumeSize" : {
+      "Description" : "WebServer EC2 instance type",
+      "Type" : "Number",
+      "Default" : "1",
+      "MinValue" : "1",
+      "MaxValue" : "1024",
+      "ConstraintDescription" : "must be between 1 and 1024 Gb."
+    },
+  
+    "InstanceType" : {
+      "Description" : "WebServer EC2 instance type",
+      "Type" : "String",
+      "Default" : "t1.micro",
+      "AllowedValues" : [ "t1.micro"],
+      "ConstraintDescription" : "must be a valid EC2 instance type."
+    },
+    "SSHLocation" : {
+      "Description" : "The IP address range that can be used to SSH to the EC2 instances",
+      "Type": "String",
+      "MinLength": "9",
+      "MaxLength": "18",
+      "Default": "0.0.0.0/0",
+      "AllowedPattern": "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})",
+      "ConstraintDescription": "must be a valid IP CIDR range of the form x.x.x.x/x."
+   }
+  },
+  
+  "Mappings" : {
+    "AWSInstanceType2Arch" : {
+      "t1.micro"    : { "Arch" : "64" }
+    },
+
+    "AWSRegionArch2AMI" : {
+      "us-west-1"      : { "32" : "ami-11d68a54", "64" : "ami-1bd68a5e" },
+      "us-west-2"      : { "32" : "ami-38fe7308", "64" : "ami-30fe7300" }
+    }
+  },
+    
+  "Resources" : {     
+   "EIPWebServer": {
+      "Type": "AWS::EC2::EIP",
+      "Properties": {
+        "Domain": "vpc",
+        "InstanceId": {"Ref": "WebServer"}
+      }
+   },   
+   "WebServer": {  
+      "Type": "AWS::EC2::Instance",
+      "Metadata" : {
+        "AWS::CloudFormation::Init" : {
+          "config" : {
+            "packages" : {
+              "yum" : {
+                "httpd"          : [],
+                "telnet"         : []
+              }
+            }
+          }
+        }
+      },
+      "Properties": {
+        "ImageId" : { "Fn::FindInMap" : [ "AWSRegionArch2AMI", { "Ref" : "AWS::Region" },
+                          { "Fn::FindInMap" : [ "AWSInstanceType2Arch", { "Ref" : "InstanceType" }, "Arch" ] } ] },
+        "InstanceType"   : { "Ref" : "InstanceType" },
+        "SecurityGroups" : [ {"Ref" : "WebServerSecurityGroup"} ],
+        "KeyName"        : { "Ref" : "KeyName" },
+        "UserData"       : { "Fn::Base64" : { "Fn::Join" : ["", [
+          "#!/bin/bash -v\n",
+          "yum update -y aws-cfn-bootstrap\n",
+
+          "# Helper function\n",
+          "function error_exit\n",
+          "{\n",
+          "  /opt/aws/bin/cfn-signal -e 1 -r \"$1\" '", { "Ref" : "WaitHandle" }, "'\n",
+          "  exit 1\n",
+          "}\n",
+
+          "# Install Apache package\n",
+          "/opt/aws/bin/cfn-init -s ", { "Ref" : "AWS::StackId" }, " -r WebServer ",
+	 	  "    --region ", { "Ref" : "AWS::Region" }, " || error_exit 'Failed to run cfn-init'\n",
+
+          "# Wait for the EBS volume to show up\n",
+          "while [ ! -e /dev/sdh ]; do echo Waiting for EBS volume to attach; sleep 5; done\n",
+
+          "# Format the EBS volume and mount it\n",
+          "mkdir /var/wwwdata\n",
+          "/sbin/mkfs -t ext4 /dev/sdh\n",
+          "mount /dev/sdh /var/wwwdata\n",
+          "echo $'\n/dev/sdh   /var/wwwdata  ext4   defaults  0   2\n' >> /etc/fstab\n",
+
+          "# Create index.html and fire up the server\n",
+          "chkconfig httpd on\n",
+          "httpd\n",
+          "cd /var/wwwdata\n",
+          "touch /var/wwwdata/index.html\n",
+          "echo \"Hello AWS World\" > /var/wwwdata/index.html\n",
+          "rm -rf /var/www/html\n",
+          "ln -s /var/wwwdata /var/www/html\n",
+
+          "# If all is well so signal success\n",
+          "/opt/aws/bin/cfn-signal -e $? -r \"Apache setup failed\" '", { "Ref" : "WaitHandle" }, "'\n"
+        ]]}}        
+      }
+    },
+
+    "WebServerSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Enable SSH access and HTTP access on the inbound port",
+        "SecurityGroupIngress" : [
+          {"IpProtocol" : "tcp", "FromPort" : "80", "ToPort" : "80", "CidrIp" : "0.0.0.0/0"},
+          {"IpProtocol" : "tcp", "FromPort" : "22", "ToPort" : "22", "CidrIp" : { "Ref" : "SSHLocation"}}
+        ]
+      }      
+    },
+
+    "DataVolume" : {
+      "Type" : "AWS::EC2::Volume",
+      "Properties" : {
+        "Size" : { "Ref" : "VolumeSize" },
+        "AvailabilityZone" : { "Fn::GetAtt" : [ "WebServer", "AvailabilityZone" ]},
+        "Tags" : [{ "Key" : "Usage", "Value" : "WWW Data Volume" }]
+      }
+    },
+
+    "MountPoint" : {
+      "Type" : "AWS::EC2::VolumeAttachment",
+      "Properties" : {
+        "InstanceId" : { "Ref" : "WebServer" },
+        "VolumeId"  : { "Ref" : "DataVolume" },
+        "Device" : "/dev/sdh"
+      }
+    },
+
+    "WaitHandle" : {
+      "Type" : "AWS::CloudFormation::WaitConditionHandle"
+    },
+
+    "WaitCondition" : {
+      "Metadata" : {
+        "Comment1" : "Note that the WaitCondition is dependent on the volume mount point allowing the volume to be created and attached to the EC2 instance",
+        "Comment2" : "The instance bootstrap script waits for the volume to be attached to the instance prior to installing index.html and signaling completion"
+      },
+      "Type" : "AWS::CloudFormation::WaitCondition",
+      "DependsOn" : "MountPoint",
+      "Properties" : {
+        "Handle" : {"Ref" : "WaitHandle"},
+        "Timeout" : "150"
+      }
+    }    
+  },
+  
+  "Outputs" : {
+    "InstanceId": {
+      "Value": {"Ref": "WebServer"}
+    },
+    "EIPWebServer": {
+      "Value": {"Ref": "EIPWebServer"}
+    },
+    "WebsiteURL" : {
+      "Value" : { "Fn::Join" : ["", ["http://", { "Fn::GetAtt" : [ "WebServer", "PublicDnsName" ]}]] },
+      "Description" : "URL for completed assignment"
+    }
+  }
+}
+
